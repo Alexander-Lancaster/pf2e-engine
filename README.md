@@ -1,13 +1,13 @@
 # PF2e character domain
 
-A dependency-free Java 21 foundation for shared GM/player encounter software.
+A Java 21 foundation with no runtime dependencies for shared GM/player encounter software.
 No UI, server, or database is required. Open this directory in your Java IDE;
-mark `src/main/java` as sources and `src/test/java` as tests if necessary.
+import `pom.xml` as a Maven project.
 
 Run compilation and regression checks with a JDK 21 or newer:
 
 ```sh
-sh test.sh
+./mvnw test
 ```
 
 ## Model
@@ -58,8 +58,8 @@ preparation. Damage input is the final damage after mitigation. Temporary HP
 source/duration and recovery eligibility remain caller responsibilities.
 Spell slots are aggregate counts for one casting pool; separate casting entries,
 prepared spell identities, and restricted slots require a richer model later.
-Action/reaction availability and initiative automation remain future encounter
-features; the encounter history framework below records resolved actions. No persistence or HTTP endpoints are implemented.
+The action engine below manages a basic three-action turn. Reaction availability
+and initiative automation remain future features. No persistence or HTTP endpoints are implemented.
 
 Rules references:
 - [Temporary Hit Points](https://2e.aonprd.com/Rules.aspx?ID=2321)
@@ -118,11 +118,151 @@ total. Records do not read live character statistics, so later effects cannot
 change previous results. Do not add component/modifier values a second time if
 you use an already-final character sheet total as the calculation's base.
 
-This framework records history; it does not yet enforce action budgets, reaction
-refresh, initiative, Delay/Ready, nested activities or interruptions, apply damage
-to characters, or resolve effect durations. It does not yet model fortune rolls,
-rerolls, damage types/critical damage, or ability-specific outcome adjustments.
-Characters remain separate from encounter history; callers manage current state.
+The history records alone do not enforce gameplay. Use the action engine below
+for supported actions, turn budgets, HP updates, and shield duration. Initiative,
+Delay/Ready, nested interruptions, general conditions, fortune/rerolls, damage
+types, and ability-specific outcome adjustments remain unsupported.
 
 Stacking and degree-of-success reference:
 [Player Core: Playing the Game](https://2e.aonprd.com/Rules.aspx?ID=2263).
+
+## Executable actions
+
+Run the deterministic demonstration after compiling:
+
+```sh
+./mvnw test
+java -cp target/classes dev.ttrpg.pf2e.ActionDemo
+```
+
+The demo shows a Strike dealing damage, Raise Shield increasing AC from 18 to 20,
+a subsequent attack missing because of that shield, a critical hit with a multiple
+attack penalty, and the shield expiring at the start of its owner's next turn.
+It is a scripted demonstration, not an interactive command-line application.
+
+- `ActionDefinition` defines executable behavior; `ActionEngine` registers definitions
+  by stable ID. The standard registry includes `strike` and `raise-shield`.
+- `ActionRequest` selects an actor, target, and equipped attack ID. Equipment values
+  come from the combatant, not the request.
+- `ActionResolution` returns the new `BattleState` and its appended `ActionRecord`.
+- `BattleState` holds current combatants, encounter history, remaining actions,
+  and attacks made. Use its lifecycle methods instead of independently updating
+  the underlying `Encounter`. Turns start with three actions and zero attacks.
+- `Combatant` adds configured equipped attacks, an optional shield, and situational
+  AC modifiers to an existing character. The character's AC must exclude these
+  additional modifiers. `armorClass()` calculates the effective AC without changing
+  sheet statistics.
+- `DiceRoller` supports manual/scripted rolls or injected `RandomGenerator` randomness.
+
+```java
+var engine = ActionEngine.standard();
+var hero = ActionDemo.fighter("Hero");
+var enemy = ActionDemo.fighter("Enemy");
+var battle = BattleState.create("Duel", java.util.List.of(hero, enemy))
+        .startRound().startTurn(hero.character().id());
+var dice = DiceRoller.random(new java.util.Random());
+var resolution = engine.resolve(battle,
+        ActionRequest.strike(hero.character().id(), enemy.character().id(), "sword"), dice);
+battle = resolution.state();
+battle = engine.resolve(battle, ActionRequest.raiseShield(hero.character().id()), dice).state();
+battle = battle.finishTurn().startTurn(enemy.character().id());
+```
+
+Strike spends one action on a hit or miss and increments the attack count. It uses
+0/-5/-10 penalties, or 0/-4/-8 for the selected agile attack. Success rolls damage;
+critical success doubles the basic damage including its flat modifier. Actual die
+faces remain recorded, with a labeled additional component explaining doubling.
+Failed checks roll no damage. Damage reduces temporary HP first, then current HP.
+
+Raise Shield requires a wielded, unbroken shield and spends one action. Its bonus
+is a circumstance modifier and therefore competes with cover and other circumstance
+bonuses. Repeated raising does not stack. It persists through other turns and round
+boundaries, expiring when its owner's next turn begins. Historical target AC remains
+unchanged after expiration. Shield Block and shield damage are not implemented.
+
+Definitions validate requests before rolling. Invalid requests leave the original
+immutable battle unchanged. A failure from a dice provider also leaves game state
+unchanged, though consumed random draws are not rolled back. Actors at zero HP
+cannot act in this simplified engine; full dying/unconscious rules are deferred.
+
+Scope: configured melee/unarmed attacks only; the caller must establish reach,
+visibility, and other spatial eligibility. No ranged ammunition, resistance,
+weakness, weapon critical traits, generic timed effects, reaction resolution,
+quickened/slowed action budgets, or automatic victory detection yet. Equipment
+profiles represent already equipped gear, not a full inventory/hand model. The
+engine does not support arbitrary historical edits or automatic state replay.
+
+Rules references:
+- [Multiple attack penalty](https://2e.aonprd.com/Rules.aspx?ID=2289)
+- [Agile](https://2e.aonprd.com/Traits.aspx?ID=526)
+- [Raise Shield and core combat rules](https://2e.aonprd.com/Rules.aspx?ID=2263)
+
+## Integrated game state
+
+Application code should use `GameState` and `GameEngine.execute`, rather than
+calling the lower-level action engine or battle lifecycle methods directly.
+`GameState.battle()` owns the current character snapshots, equipment, effects,
+turn counters and encounter history; `GameState.character(id)` is the same HP and
+resources that a character sheet should display. Never keep a second mutable
+character-sheet copy.
+
+```java
+var engine = GameEngine.standard();
+var state = GameState.create("Duel", java.util.List.of(
+        ActionDemo.fighter("Hero"), ActionDemo.fighter("Enemy")));
+var dice = DiceRoller.random(new java.util.Random());
+state = engine.execute(state, state.revision(), new GameCommand.StartRound(), dice).state();
+var actor = state.battle().combatants().keySet().iterator().next();
+state = engine.execute(state, state.revision(), new GameCommand.StartTurn(actor), dice).state();
+var result = engine.execute(state, state.revision(),
+        new GameCommand.PerformAction(ActionRequest.raiseShield(actor)), dice);
+state = result.state();
+```
+
+Supported commands: start round, start turn, end turn, end encounter, perform an
+action, and explicit GM damage adjustment with a reason. Each accepted command
+increments the revision exactly once and appends a `TransitionRecord`. The record
+contains the action/roll snapshot where applicable and typed `StateChange` entries:
+participant before/after snapshots, turn budgets, and encounter progression.
+Participant snapshots expose HP, resources and effects without parsing log text.
+Rejected commands return no replacement state and append no history.
+
+`ActiveEffect` supplies a source, unique instance ID, target statistic (AC or
+attack), typed modifier, and optional participant whose next turn expires it.
+Expiry is processed across all participants when that turn starts, including
+effects on someone other than the turn owner. Empty expiry means no automatic
+expiration. Raise Shield replaces its previous effect, so it cannot accumulate;
+its convenience boolean accessor is derived from effects. Historical calculations
+remain frozen. Generic effect creation/removal commands are not implemented yet.
+
+The caller supplies the last observed revision. A mismatch is rejected before
+rolling. This is an optimistic-concurrency building block, **not a concurrent
+server**: a future repository must atomically compare-and-swap the stored revision
+and publish the returned state. Two independent calls against the same old snapshot
+can both compute results; only the storage boundary can choose one to commit.
+Command authentication (including authorization for GM adjustments), networking,
+save-file serialization, and undo/replay are not implemented. State constructors
+and lower-level methods remain available for fixtures/imports; clients must route
+changes through the game engine to maintain revision history.
+
+## Maven build
+
+Requires JDK 21 or newer. The checked-in Maven Wrapper downloads the pinned Maven
+version on first use; no global Maven installation is needed. First use requires
+network access for Maven, build plugins, and JUnit dependencies. On Windows use
+`mvnw.cmd` in place of `./mvnw`.
+
+```sh
+./mvnw test           # Run named JUnit 5 tests
+./mvnw clean verify   # Clean build, test, and package the library JAR
+./mvnw -Dtest=ActionTest test  # Run one test class
+java -cp target/classes dev.ttrpg.pf2e.ActionDemo
+```
+
+JUnit and Surefire replace the custom main-method test harness. Reports are in
+`target/surefire-reports/`; the library JAR is `target/pf2e-engine-0.1.0-SNAPSHOT.jar`.
+`sh test.sh` remains a compatibility shortcut that delegates to Maven. Include
+`pom.xml`, `mvnw`, `mvnw.cmd`, and `.mvn/wrapper/maven-wrapper.properties` in Git.
+The wrapper uses script-only mode and requires no checked-in JAR. Existing IDE
+metadata remains ignored. Production rules and state classes are unchanged by
+this build migration.
